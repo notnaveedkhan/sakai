@@ -15,15 +15,23 @@ package org.sakaiproject.webapi.controllers;
 
 import org.apache.commons.lang3.StringUtils;
 
+import org.sakaiproject.authz.api.Member;
+import org.sakaiproject.authz.api.Role;
 import org.sakaiproject.component.api.ServerConfigurationService;
 import org.sakaiproject.coursemanagement.api.CourseManagementService;
+import org.sakaiproject.db.api.SqlService;
+import org.sakaiproject.exception.IdUnusedException;
 import org.sakaiproject.messaging.api.UserMessagingService;
 import org.sakaiproject.messaging.api.model.UserNotification;
 import org.sakaiproject.site.api.Site;
 import org.sakaiproject.site.api.ToolConfiguration;
 import org.sakaiproject.user.api.UserNotDefinedException;
+import org.sakaiproject.webapi.beans.SiteMemberRestBean;
+import org.sakaiproject.webapi.beans.SiteScheduledRestBean;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -31,6 +39,11 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 
 import java.util.HashMap;
 import java.util.List;
@@ -54,6 +67,9 @@ public class SitesController extends AbstractSakaiApiController {
 
 	@Autowired
 	private UserMessagingService userMessagingService;
+
+	@Autowired
+	private SqlService sqlService;
 
 	@GetMapping(value = "/users/{userId}/sites", produces = MediaType.APPLICATION_JSON_VALUE)
     public Map<String, List<Map<String, Object>>> getSites(@PathVariable String userId, @RequestParam Optional<Boolean> pinned)
@@ -109,4 +125,80 @@ public class SitesController extends AbstractSakaiApiController {
                     return site;
                 }).filter(Objects::nonNull).collect(Collectors.toList()));
 	}
+
+    /* Endpoint to fetch a SINGLE site membership (the user's current role in the site realm) so an external
+       system (WTM) can register a missing membership before retrying a dropped grade. Reads the LIVE realm
+       via Site.getMember - unlike /membership/scheduled it does not depend on user_audits_log, so it also
+       surfaces enrolments created before go-live or via unaudited paths. 404 when the user is not a member. */
+    @GetMapping(value = "/sites/{siteId}/members/{userId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<SiteMemberRestBean> getSiteMember(
+        @PathVariable String siteId,
+        @PathVariable String userId
+    ) {
+
+        checkSakaiSession();
+
+        try {
+            Site site = siteService.getSite(siteId);
+            Member member = site.getMember(userId);
+            if (member == null) {
+                return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+            }
+            Role role = member.getRole();
+            String roleId = role != null ? role.getId() : null;
+            SiteMemberRestBean bean = new SiteMemberRestBean(siteId, member.getUserId(), roleId, member.isActive());
+            return new ResponseEntity<>(bean, HttpStatus.OK);
+        } catch (IdUnusedException e) {
+            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+        } catch (Exception e) {
+            log.error("getSiteMember failed for siteId=" + siteId + " userId=" + userId + ": " + e.getMessage(), e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    /* Endpoint to fetch a SINGLE site/course by its Sakai site id, in the same shape as /sites/scheduled, so
+       an external system (WTM) can register a missing course before retrying a dropped grade. 404 when absent. */
+    @GetMapping(value = "/sites/{siteId}/details", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<SiteScheduledRestBean> getSiteDetails(@PathVariable String siteId) {
+
+        checkSakaiSession();
+
+        // Lookup is by SITE_ID (the primary key), so no TYPE filter is applied: a caller that names an
+        // exact site must be able to reconcile it even when its TYPE is unset (e.g. legacy/imported sites).
+        // A "TYPE in ('project','course')" predicate would wrongly 404 such a site despite it being a real,
+        // published, non-user, non-special site.
+        String query = "SELECT SITE_ID, TITLE, CREATEDON, MODIFIEDON, SOFTLY_DELETED_DATE " +
+            "FROM SAKAI_SITE WHERE SITE_ID = ?";
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            conn = sqlService.borrowConnection();
+            conn.setReadOnly(true);
+            ps = conn.prepareStatement(query);
+            ps.setString(1, siteId);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                SiteScheduledRestBean bean = new SiteScheduledRestBean(
+                    rs.getString("SITE_ID"), rs.getString("TITLE"), rs.getString("CREATEDON"),
+                    rs.getString("MODIFIEDON"), rs.getString("SOFTLY_DELETED_DATE"));
+                return new ResponseEntity<>(bean, HttpStatus.OK);
+            }
+            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+        } catch (Exception e) {
+            log.error("getSiteDetails failed for siteId=" + siteId + ": " + e.getMessage(), e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+        } finally {
+            try {
+                if (rs != null) rs.close();
+                if (ps != null) ps.close();
+            } catch (SQLException e) {
+                log.error("SQLException in finally block: " + e);
+            }
+            if (conn != null) {
+                sqlService.returnConnection(conn);
+            }
+        }
+    }
 }
